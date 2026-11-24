@@ -1,0 +1,8 @@
+# Opt-in overlay: lets jobs run `docker build` / `docker run` against Docker
+# Desktop. Added by `deskrunner.ps1 start <target> -Docker`.
+# This gives every job full control of Docker on this PC. Only use it for
+# repos whose workflows need Docker and whose code you trust.
+services:
+  runner:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

@@ -1,0 +1,43 @@
+# Self-hosted GitHub Actions runner, one compose project per org or per repo.
+# Start through deskrunner.ps1 so the scope, target, token and project name are set for you.
+
+services:
+  runner:
+    image: myoung34/github-runner:ubuntu-noble
+    restart: unless-stopped
+    # Time for the runner to deregister itself from GitHub on stop.
+    stop_grace_period: 45s
+    environment:
+      RUNNER_SCOPE: ${RUNNER_SCOPE:?Start runners through deskrunner.ps1}
+      ORG_NAME: ${ORG_NAME:-}
+      REPO_URL: ${REPO_URL:-}
+      ACCESS_TOKEN: ${ACCESS_TOKEN:?Start runners through deskrunner.ps1}
+      RUNNER_NAME_PREFIX: ${RUNNER_NAME_PREFIX:-desk}
+      RANDOM_RUNNER_SUFFIX: "true"
+      LABELS: ${RUNNER_LABELS:-deskrunner}
+      RUNNER_GROUP: ${RUNNER_GROUP:-Default}
+      # Persistent runner: caches stay warm between jobs.
+      EPHEMERAL: "false"
+      DISABLE_AUTO_UPDATE: "true"
+      # Shared caches (named volumes below).
+      RUNNER_TOOL_CACHE: /opt/hostedtoolcache
+      npm_config_cache: /cache/npm
+      npm_config_store_dir: /cache/pnpm-store
+      UV_CACHE_DIR: /cache/uv
+      PIP_CACHE_DIR: /cache/pip
+    volumes:
+      - toolcache:/opt/hostedtoolcache
+      - cache:/cache
+      # Docker access for jobs is opt-in: see compose.docker.yaml (-Docker).
+    deploy:
+      resources:
+        limits:
+          cpus: "${RUNNER_CPUS:-4}"
+          memory: ${RUNNER_MEMORY:-6g}
+
+# Fixed names so every target's runners share the same caches.
+volumes:
+  toolcache:
+    name: deskrunner-toolcache
+  cache:
+    name: deskrunner-cache
