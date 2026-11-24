@@ -126,6 +126,78 @@ function Assert-PrivateRepo([string]$Repo, [string]$Token) {
     }
 }
 
+# --- Runner registration ---------------------------------------------------
+# The GitHub token stays in this script. Containers only get a registration
+# token: it expires after one hour and can do nothing but add a runner.
+# Because the containers hold no token that could remove a runner, this script
+# removes runners from GitHub itself.
+
+function Get-ApiBase([string]$Target) {
+    if ($Target -match '/') { "/repos/$Target" } else { "/orgs/$Target" }
+}
+
+function Get-RegistrationToken([string]$Target, [string]$Token) {
+    $response = Invoke-GitHub "$(Get-ApiBase $Target)/actions/runners/registration-token" $Token 'Post'
+    if ($response.StatusCode -ne 201) {
+        throw "GitHub returned $($response.StatusCode) when asked for a runner registration token for '$Target'. The token needs the 'repo' scope (repo targets) or 'admin:org' (org targets), or the fine-grained permissions listed in the README."
+    }
+    ($response.Content | ConvertFrom-Json).token
+}
+
+function Get-ProjectContainers([string]$Project) {
+    @(docker ps -a -q --no-trunc --filter "label=com.docker.compose.project=$Project" --filter 'label=com.docker.compose.service=runner')
+}
+
+# Reads which GitHub runner a container is registered as. The runner's own
+# settings file holds the ID and name, and no secrets. Works for stopped
+# containers too. Returns nothing if the container never registered.
+function Get-RunnerInfo([string]$ContainerId) {
+    $temp = Join-Path ([System.IO.Path]::GetTempPath()) ("deskrunner-" + [guid]::NewGuid().ToString('N') + '.json')
+    try {
+        docker cp "${ContainerId}:/actions-runner/.runner" $temp 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $temp)) { return }
+        $info = Get-Content $temp -Raw | ConvertFrom-Json
+        if ($info.agentId) {
+            [pscustomobject]@{ Container = $ContainerId; Id = $info.agentId; Name = $info.agentName }
+        }
+    } catch {
+        return
+    } finally {
+        Remove-Item $temp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-ProjectRunners([string]$Project) {
+    @(Get-ProjectContainers $Project | ForEach-Object { Get-RunnerInfo $_ } | Where-Object { $_ })
+}
+
+function Remove-GitHubRunner([string]$Target, [string]$Token, $Runner) {
+    $response = Invoke-GitHub "$(Get-ApiBase $Target)/actions/runners/$($Runner.Id)" $Token 'Delete'
+    if ($response.StatusCode -in 204, 404) {
+        Write-Host "Removed runner $($Runner.Name) from GitHub."
+    } else {
+        Write-Warning "Could not remove runner $($Runner.Name) from GitHub (HTTP $($response.StatusCode)). Delete it under Settings > Actions > Runners."
+    }
+}
+
+# Waits until every container of the project has registered. Returns $true if all did.
+function Wait-Runners([string]$Project, [int]$TimeoutSeconds = 90) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $containers = Get-ProjectContainers $Project
+        $runners = Get-ProjectRunners $Project
+        if ($containers.Count -gt 0 -and $runners.Count -eq $containers.Count) { break }
+        Start-Sleep -Seconds 3
+    } while ((Get-Date) -lt $deadline)
+
+    foreach ($runner in $runners) { Write-Host "Runner registered: $($runner.Name)" }
+    if ($containers.Count -eq 0 -or $runners.Count -lt $containers.Count) {
+        Write-Warning "$($containers.Count - $runners.Count) of $($containers.Count) runner(s) did not register within $TimeoutSeconds seconds. Check: deskrunner.ps1 logs <target>"
+        return $false
+    }
+    $true
+}
+
 # --- Fallback switch -------------------------------------------------------
 # start sets the repo variable so workflows run here; stop deletes it so they
 # fall back to GitHub-hosted runners. Both return a short result word.
@@ -517,15 +589,6 @@ if ($isRepo) {
 $useSwitch = $isRepo -and -not $NoSwitch
 $token = $null
 
-if ($Action -in 'start', 'restart') {
-    $token = Get-Token
-    if ($isRepo) { Assert-PrivateRepo $Target $token }
-    $env:ACCESS_TOKEN = $token
-} else {
-    # stop and logs do not need the token for Docker; compose only needs the variable to exist.
-    $env:ACCESS_TOKEN = 'unused'
-}
-
 $project = $projectPrefix + ($Target.ToLower() -replace '[^a-z0-9_-]', '-')
 $compose = @('compose', '-p', $project, '-f', $composeFile)
 if ($Docker) {
@@ -536,36 +599,75 @@ if ($Docker) {
     $env:RUNNER_LABELS = 'deskrunner'
 }
 
+# Compose needs the variable to exist to read its file. start and restart
+# replace this placeholder with a real registration token.
+$env:RUNNER_TOKEN = 'unused'
+$code = 1
+
 try {
-    if ($Action -eq 'stop' -and $useSwitch) {
-        # Send new jobs back to GitHub before the runners go away.
+    if ($Action -eq 'logs') {
+        docker @compose logs -f --tail 100
+        $code = $LASTEXITCODE
+    }
+    elseif ($Action -eq 'stop') {
         try {
             $token = Get-Token
-            Write-SwitchResult (Disable-RunnerSwitch $Target $token) $Target
         } catch {
-            Write-Warning "Could not delete variable $switchName on ${Target}: $($_.Exception.Message) Jobs will wait for a runner until you delete it: gh variable delete $switchName --repo $Target"
+            Write-Warning "No GitHub token: $($_.Exception.Message) The runners will be stopped, but they stay listed as offline on GitHub and the $switchName variable is not changed."
+        }
+
+        # Send new jobs back to GitHub before the runners go away.
+        if ($token -and $useSwitch) {
+            Write-SwitchResult (Disable-RunnerSwitch $Target $token) $Target
+        }
+
+        $runners = Get-ProjectRunners $project
+        # down, not stop: the next start begins with fresh containers.
+        # Caches live in named volumes and survive.
+        docker @compose down
+        $code = $LASTEXITCODE
+
+        if ($code -eq 0 -and $token) {
+            foreach ($runner in $runners) { Remove-GitHubRunner $Target $token $runner }
+        } elseif ($runners.Count -gt 0) {
+            Write-Warning "Not removed from GitHub: $($runners.Name -join ', '). Delete them under Settings > Actions > Runners."
         }
     }
+    else {
+        # start and restart
+        $token = Get-Token
+        if ($isRepo) { Assert-PrivateRepo $Target $token }
 
-    switch ($Action) {
-        'start'   { docker @compose up -d --scale "runner=$Count" }
-        # down, not stop: the runner deregisters from GitHub on exit, so the next
-        # start must be a fresh container. Caches live in named volumes and survive.
-        'stop'    { docker @compose down }
-        'restart' { docker @compose up -d --force-recreate --scale "runner=$Count" }
-        'logs'    { docker @compose logs -f --tail 100 }
-    }
-    $code = $LASTEXITCODE
+        $before = Get-ProjectRunners $project
+        $env:RUNNER_TOKEN = Get-RegistrationToken $Target $token
 
-    if ($Action -in 'start', 'restart' -and $code -eq 0) {
-        if ($useSwitch) {
-            Write-SwitchResult (Enable-RunnerSwitch $Target $token) $Target
-        } elseif (-not $isRepo) {
-            Write-Host "Org target: set the $switchName variable yourself, per repo or for the org (gh variable set $switchName --body $switchValue)."
+        if ($Action -eq 'start') {
+            # Keep runners that are already up: recreating them would kill running jobs.
+            docker @compose up -d --no-recreate --scale "runner=$Count"
+        } else {
+            docker @compose up -d --force-recreate --scale "runner=$Count"
+        }
+        $code = $LASTEXITCODE
+
+        # A container that is gone cannot come back, so remove its runner from GitHub.
+        $alive = Get-ProjectContainers $project
+        foreach ($runner in $before) {
+            if ($runner.Container -notin $alive) { Remove-GitHubRunner $Target $token $runner }
+        }
+
+        if ($code -eq 0) {
+            $registered = Wait-Runners $project
+            if (-not $registered) {
+                $code = 1
+            } elseif ($useSwitch) {
+                Write-SwitchResult (Enable-RunnerSwitch $Target $token) $Target
+            } elseif (-not $isRepo) {
+                Write-Host "Org target: set the $switchName variable yourself, per repo or for the org (gh variable set $switchName --body $switchValue)."
+            }
         }
     }
 } finally {
-    # Do not leave the token in this PowerShell session.
-    Remove-Item Env:ACCESS_TOKEN -ErrorAction SilentlyContinue
+    # Do not leave the registration token in this PowerShell session.
+    Remove-Item Env:RUNNER_TOKEN -ErrorAction SilentlyContinue
 }
 exit $code

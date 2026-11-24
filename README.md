@@ -40,6 +40,8 @@ deskrunner makes that a single command on a Windows PC:
   jobs. There is no port to open and no URL to share.
 - **Caches stay warm.** pnpm, npm, uv, pip and tool downloads are kept between
   jobs, so repeat runs are often faster than on GitHub.
+- **Your GitHub token stays out of the containers.** Jobs can read what is
+  inside a runner container, so it only ever holds a one-hour registration token.
 - **You can always go back.** `stop` sends your CI back to GitHub-hosted runners.
 
 It is for one person with one PC and a handful of private repos. It is not:
@@ -123,17 +125,20 @@ and can be omitted when `DEFAULT_TARGET` is set in `.env`.
 | `./deskrunner.ps1 savings <owner/repo> [-Days 30]` | Show billable minutes per workflow and what can move |
 | `./deskrunner.ps1 init [path] [-DryRun]` | Make a checkout's workflows switchable (default path: current folder) |
 | `./deskrunner.ps1 start <target>` | Start one runner, register it with GitHub and switch the repo to it |
-| `./deskrunner.ps1 start <target> -Count 3` | Start three parallel runners |
+| `./deskrunner.ps1 start <target> -Count 3` | Run three parallel runners. Runners that are already up are kept; extra ones are added or removed |
 | `./deskrunner.ps1 start <target> -Docker` | Start with access to Docker Desktop, for workflows that build or run containers |
-| `./deskrunner.ps1 stop <target>` | Switch the repo back to GitHub, then deregister and remove the runners (caches are kept) |
-| `./deskrunner.ps1 restart <target> [-Count N] [-Docker]` | Recreate the runners, e.g. after an image update |
+| `./deskrunner.ps1 stop <target>` | Switch the repo back to GitHub, stop the runners and remove them from GitHub (caches are kept) |
+| `./deskrunner.ps1 restart <target> [-Count N] [-Docker]` | Replace all runners with new ones, e.g. after an image update or to add or drop `-Docker` |
 | `./deskrunner.ps1 status` | List runner containers for all targets |
 | `./deskrunner.ps1 logs <target>` | Follow the runner logs |
 | `./deskrunner.ps1 update` | Pull the newest runner image |
 
 Runners come back automatically when Docker Desktop starts, unless they were
-stopped with `stop`. Quitting or pausing Docker Desktop takes them offline;
-jobs then wait in the queue until a runner is back.
+stopped with `stop`. They keep their registration, so no token is needed.
+After a quick restart it can take about three minutes before they accept jobs
+again, because GitHub first has to time out the old connection. Quitting or
+pausing Docker Desktop takes them offline; jobs then wait in the queue until a
+runner is back.
 
 Each runner container is limited to 4 CPUs and 6 GB by default
 (`RUNNER_CPUS`, `RUNNER_MEMORY` in `.env`). A single runner executes one job
@@ -283,6 +288,88 @@ on runners started with `-Docker`.
     cancel-in-progress: true
   ```
 
+## How your GitHub token is protected
+
+### The problem
+
+Registering a runner needs a GitHub token with a lot of power. A classic token
+with the `repo` scope can read and write every private repo you own.
+
+The usual way to run a runner in Docker is to hand that token to the
+container. But a job is just code running inside that container, as root: your
+tests, every dependency's install script and every third-party action. All of
+it can read what the container holds, including its environment. Runner images
+hide the token from the job's own environment variables, yet it stays readable
+in the container's first process (`/proc/1/environ`).
+
+So one bad dependency in one repo could walk away with a token that opens all
+your repos.
+
+### What deskrunner does
+
+deskrunner uses two tokens and keeps the powerful one on your PC.
+
+| | Your GitHub token | Registration token |
+|---|---|---|
+| Comes from | 1Password | GitHub, on request, at `start` and `restart` |
+| Held by | `deskrunner.ps1` on your PC, only while a command runs | The runner containers |
+| Can jobs read it? | **No** | Yes |
+| Valid for | Until you revoke it | One hour |
+| Can do | Everything its scopes allow | Add a runner to that one repo or org, nothing else |
+| Stored by deskrunner | Never | In Docker's settings for the container, until the container is removed |
+
+What happens on `start`:
+
+1. deskrunner reads your token from 1Password. 1Password may ask you to approve.
+2. On your PC, it uses the token to check the repo is private and to ask
+   GitHub for a registration token.
+3. It starts the containers with the registration token only. Each runner uses
+   it once to register. From then on the runner talks to GitHub with its own
+   credentials, which are only good for being that one runner.
+4. On your PC, it sets the `RUNNER` variable.
+5. The command ends and your token is gone from memory.
+
+On `stop`, deskrunner reads your token again and, from your PC, deletes the
+`RUNNER` variable, stops the containers and removes the runners from GitHub.
+The containers could not do that themselves: they hold nothing that can remove
+a runner.
+
+When a container restarts, for example after Docker Desktop restarts, the
+runner reuses its own credentials. No token is needed.
+
+You can check this yourself on a running runner:
+
+```powershell
+docker inspect <container> --format '{{range .Config.Env}}{{println .}}{{end}}' | Select-String TOKEN
+```
+
+The only match is `RUNNER_TOKEN`, the registration token.
+
+### What a job can still reach
+
+Keeping your token out limits the damage. It does not make untrusted code safe.
+A job on deskrunner can still reach:
+
+- **The registration token, for up to an hour after `start`.** A job could use
+  it to register a runner of its own for the same repo or org. If you ever see
+  a runner you did not start under Settings > Actions > Runners, delete it.
+- **The runner's own credentials.** This is true of every self-hosted runner.
+  They stop working when you `stop` or `restart`, because deskrunner removes
+  the runner from GitHub.
+- **That job's secrets and the repo's code**, as on GitHub's own runners.
+- **The shared caches.** All targets on your PC share the pnpm, npm, uv, pip
+  and tool caches, so a job in one repo can change what a job in another repo
+  later installs from cache.
+- **Your network**, including other devices on it.
+- **Docker Desktop, if you started the runners with `-Docker`.** That is close
+  to full control of your PC.
+
+### Make it tighter
+
+Use a fine-grained token that only covers the repos you run on deskrunner,
+with only the permissions listed in [One-time setup](#one-time-setup). Then
+even your real token can do little outside those repos.
+
 ## Security
 
 - **Private repos only.** On a public repo, a fork pull request could run any
@@ -291,10 +378,8 @@ on runners started with `-Docker`.
 - **Org targets:** deskrunner cannot check every repo in an org. Keep
   "Allow public repositories" turned off for the org's runner group (GitHub's
   default) so public repos in the org cannot use the runners.
-- **The token** is read from 1Password at `start` and `restart` and passed to
-  the container as an environment variable, because the runner needs it to
-  register and deregister. It is visible in `docker inspect` while the
-  container exists. `stop` removes the container.
+- **Your GitHub token never enters a container.** See
+  [How your GitHub token is protected](#how-your-github-token-is-protected).
 - **`-Docker` gives jobs full control of Docker Desktop.** Use it only for
   repos that need it.
 - **Dependency-update PRs** (Dependabot, Renovate) run third-party install
@@ -310,7 +395,8 @@ on runners started with `-Docker`.
 | `start` says the repo is public | Working as intended; deskrunner does not serve public repos |
 | Runner logs show 401/403/404 on registration | The token lacks the scope for that target, or has expired. Run `doctor` |
 | `command not found` in a step | The tool is not in the image; add the matching `setup-*` action |
-| Offline runners piling up in GitHub settings | A runner was killed without deregistering; delete them under Settings > Actions > Runners |
+| A runner does not connect again after a long break | GitHub removes runners that were offline for 14 days. Run `restart <target>` to register new ones |
+| Offline runners listed in GitHub settings | Containers were removed with Docker directly, or `stop` could not reach 1Password. Delete them under Settings > Actions > Runners |
 
 ## Credits
 

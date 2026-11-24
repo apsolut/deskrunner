@@ -5,13 +5,17 @@ services:
   runner:
     image: myoung34/github-runner:ubuntu-noble
     restart: unless-stopped
-    # Time for the runner to deregister itself from GitHub on stop.
-    stop_grace_period: 45s
+    # Time for a running job step to end. Runners are removed from GitHub by
+    # deskrunner.ps1, not by the container.
+    stop_grace_period: 30s
     environment:
       RUNNER_SCOPE: ${RUNNER_SCOPE:?Start runners through deskrunner.ps1}
       ORG_NAME: ${ORG_NAME:-}
       REPO_URL: ${REPO_URL:-}
-      ACCESS_TOKEN: ${ACCESS_TOKEN:?Start runners through deskrunner.ps1}
+      # A registration token fetched by deskrunner.ps1. It expires after one
+      # hour and can only add a runner. Your GitHub token never enters the
+      # container, because jobs could read it there.
+      RUNNER_TOKEN: ${RUNNER_TOKEN:?Start runners through deskrunner.ps1}
       RUNNER_NAME_PREFIX: ${RUNNER_NAME_PREFIX:-desk}
       RANDOM_RUNNER_SUFFIX: "true"
       LABELS: ${RUNNER_LABELS:-deskrunner}
@@ -19,12 +23,21 @@ services:
       # Persistent runner: caches stay warm between jobs.
       EPHEMERAL: "false"
       DISABLE_AUTO_UPDATE: "true"
+      # The container has no token that could remove the runner from GitHub;
+      # deskrunner.ps1 does that from the host.
+      DISABLE_AUTOMATIC_DEREGISTRATION: "true"
+      # Keep the registration when the container restarts (for example after
+      # Docker Desktop restarts), so a restart needs no new token.
+      CONFIGURED_ACTIONS_RUNNER_FILES_DIR: /runner-config
       # Shared caches (named volumes below).
       RUNNER_TOOL_CACHE: /opt/hostedtoolcache
       npm_config_cache: /cache/npm
       npm_config_store_dir: /cache/pnpm-store
       UV_CACHE_DIR: /cache/uv
       PIP_CACHE_DIR: /cache/pip
+    tmpfs:
+      # Must exist for CONFIGURED_ACTIONS_RUNNER_FILES_DIR. In memory, one per container.
+      - /runner-config
     volumes:
       - toolcache:/opt/hostedtoolcache
       - cache:/cache

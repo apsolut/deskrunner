@@ -161,8 +161,12 @@ deskrunner is deliberately small and opinionated. Keep it that way.
   systems, other secret stores, plain tokens, or a flag that allows public repos.
 - **One script.** Everything is in `deskrunner.ps1`, with `compose.yaml` and
   `compose.docker.yaml` beside it. Do not add a build step or dependencies.
-- **The token never touches disk** and is never printed. It is passed to
-  Docker through an environment variable and removed from the session afterwards.
+- **The GitHub token never touches disk, is never printed and never enters a
+  container.** Jobs run as root in the runner container and can read its
+  environment and files. Containers only get a one-hour registration token,
+  and every call that needs the real token (the privacy check, the `RUNNER`
+  variable, removing runners) is made by the script on the host. Do not add
+  anything that passes the real token to Docker.
 - **The README must match the script.** Change both in the same commit when
   behaviour, commands, labels or permissions change. Update this file too.
 - **Names that users depend on:** the runner label `deskrunner`, the variable
