@@ -69,8 +69,9 @@ yourself: per-target runner stacks, 1Password token handling, a public-repo
 guard, shared caches, resource limits, a workflow converter (`init`), a usage
 report (`savings`) and an automatic fallback to GitHub-hosted runners.
 
-> **For AI agents working in another project:** read "Use it from a project"
-> below. Do not edit files in this folder or read `.env` unless the user asks.
+> **For AI agents:** read [AGENTS.md](AGENTS.md). It has the rules and the
+> steps for moving a project's CI to deskrunner. Do not edit files in this
+> folder or read `.env` unless the user asks.
 
 ## How it works
 
