@@ -522,7 +522,12 @@ function Invoke-Doctor {
                     Report $true "GitHub token: valid for '$login', scopes: $scopes"
                     $list = $scopes -split ',\s*'
                     Report ($list -contains 'repo') 'Scope for repo runners (repo)' 'Add the `repo` scope to the token.'
-                    Report ($list -contains 'admin:org') 'Scope for org runners (admin:org)' 'Add `admin:org` if you use org targets.'
+                    # Only needed for org targets, so its absence is not a failure.
+                    if ($list -contains 'admin:org') {
+                        Report $true 'Scope for org runners (admin:org)'
+                    } else {
+                        Write-Host '[info] No admin:org scope: org targets (my-org) will not work. Repo targets (owner/repo) are not affected.'
+                    }
                 } else {
                     Report $true "GitHub token: valid for '$login' (fine-grained token; GitHub does not list its permissions)"
                 }

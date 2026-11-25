@@ -20,8 +20,9 @@ services:
       RANDOM_RUNNER_SUFFIX: "true"
       LABELS: ${RUNNER_LABELS:-deskrunner}
       RUNNER_GROUP: ${RUNNER_GROUP:-Default}
-      # Persistent runner: caches stay warm between jobs.
-      EPHEMERAL: "false"
+      # Do not add EPHEMERAL here, not even as "false": the image treats any
+      # value as "on". An ephemeral runner removes itself after one job and
+      # could not register again once the registration token has expired.
       DISABLE_AUTO_UPDATE: "true"
       # The container has no token that could remove the runner from GitHub;
       # deskrunner.ps1 does that from the host.
